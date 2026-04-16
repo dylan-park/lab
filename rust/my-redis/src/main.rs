@@ -1,15 +1,55 @@
-use mini_redis::{Result, client};
+use mini_redis::{Connection, Frame};
+use tokio::net::{TcpListener, TcpStream};
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    // open a connection to mini-redis
-    let mut client = client::connect("127.0.0.1:6379").await?;
-    // set key "hello" with value "world"
-    client.set("hello", "world".into()).await?;
-    // get key "hello"
-    let result = client.get("hello").await?;
+async fn main() {
+    // bind the listener to the address
+    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
 
-    println!("got value from the server; result={:?}", result);
+    loop {
+        // the second item contains the ip and port of the new connection
+        let (socket, _) = listener.accept().await.unwrap();
+        // a new task is spawned for each inbound socket. the socket is
+        // moved to the new task and processed there
+        tokio::spawn(async move {
+            process(socket).await;
+        });
+    }
+}
 
-    Ok(())
+async fn process(socket: TcpStream) {
+    use mini_redis::Command::{self, Get, Set};
+    use std::collections::HashMap;
+
+    // a hashmap is used to store data
+    let mut db = HashMap::new();
+
+    // `Connection`, provided by `mini-redis`, handles parsing frames from
+    // the socket
+    let mut connection = Connection::new(socket);
+
+    // use `read_frame` to receive a command from the connection.
+    while let Some(frame) = connection.read_frame().await.unwrap() {
+        let response = match Command::from_frame(frame).unwrap() {
+            Set(cmd) => {
+                // the value is stored as `Vec<u8>`
+                db.insert(cmd.key().to_string(), cmd.value().to_vec());
+                Frame::Simple("OK".to_string())
+            }
+            Get(cmd) => {
+                if let Some(value) = db.get(cmd.key()) {
+                    // `Frame::Bulk` expects data to be of type `Bytes`
+                    // this type will be modified later
+                    // for now,`&Vec<u8>` is converted to `Bytes` using `into()`.
+                    Frame::Bulk(value.clone().into())
+                } else {
+                    Frame::Null
+                }
+            }
+            cmd => panic!("unimplemented {:?}", cmd),
+        };
+
+        // write the response to the client
+        connection.write_frame(&response).await.unwrap();
+    }
 }
